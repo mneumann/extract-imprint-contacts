@@ -10,6 +10,8 @@ require 'selenium-webdriver'
 require 'pp'
 require 'uri'
 require 'json'
+require 'nokogiri'
+require 'open-uri'
 
 CHAR_RANGES = [
   0x2B .. 0x3A, # 0-9 . , - + / :
@@ -57,9 +59,9 @@ def decode_mailto(mailto, domain='.de')
   mailto = decode_mailto_exact(mailto, domain)
   return mailto if mailto.include?('@')
 
-  for suffix in %w(de org com net fr uk us)
+  for suffix in %w(de eu org com net info fr uk us)
     mailto = decode_mailto_exact(mailto, suffix)
-    return mailto if mailto.include?('@')
+    return mailto if mailto and mailto.include?('@')
   end
 
   # (-14..14).upto {|offset| }
@@ -86,6 +88,21 @@ end
 def wait_until(timeout: 10, &block)
   Selenium::WebDriver::Wait.new(timeout: timeout).until(&block)
 end
+
+class Fetcher
+  def initialize(rate_limit_per_host_per_second: 1)
+  end
+
+  def fetch(url)
+    uri = URI.parse(url)
+    uri.open {|f|
+      f.read
+    }
+  rescue => ex
+    STDERR.puts "Got exception in Fetcher: #{ex}"
+  end
+end
+
 
 
 class DuckduckGo
@@ -146,60 +163,130 @@ class DuckduckGo
   end
 end
 
-def crawl_site(driver, searchterm)
-  site_link = DuckduckGo.search(driver, searchterm)
+class Crawler
+  attr_reader :driver, :fetcher
 
-  STDERR.puts "Site: #{site_link}"
+  def initialize(driver:, fetcher:)
+    @driver = driver
+    @fetcher = fetcher
+  end
 
-  domain = URI.parse(site_link).host
-  mail_domain = domain.strip_prefix("www.")
+  def url_from_searchterm(searchterm)
+    site_link = DuckduckGo.search(@driver, searchterm)
 
-  driver.get(site_link)
+    STDERR.puts "Site: #{site_link}"
 
-  wait_until {
-    driver.execute_script("return document.readyState;") == 'complete'
-  }
+    site_link
+  end
 
-  driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+  def crawl_site_from_searchterm(searchterm)
+    site_link = url_from_searchterm(searchterm)
+    crawl_site_using_fetcher(site_link)
+  end
 
-  found_emails = []
+  def crawl_site_using_driver(site_link)
+    domain = URI.parse(site_link).host
+    mail_domain = domain.strip_prefix("www.")
 
-  driver.find_element(css: 'body').text.scan(/[0-9A-Za-z.,+\/:-]+@[^.]+\.de/) {|match|
-    found_emails << match
-  }
+    @driver.get(site_link)
 
-  uses_encryption = false
+    wait_until {
+      @driver.execute_script("return document.readyState;") == 'complete'
+    }
 
-  driver.find_elements(tag_name: "a").each { |elm|
-    href = elm['href']
-    case href
-    when /^mailto:/i
-      href = CGI.unescape(href)
-      email = href.strip_prefix("mailto:").strip
-      if email.include?("@")
-        found_emails << email 
-      else
-        STDERR.puts "invalid mailto link"
+    @driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+
+    found_emails = []
+
+    @driver.find_element(css: 'body').text.scan(/[0-9A-Za-z.,+\/:-]+@[^.]+\.de/) {|match|
+      found_emails << match
+    }
+
+    uses_encryption = false
+
+    @driver.find_elements(tag_name: "a").each { |elm|
+      href = elm['href']
+      case href
+      when /^mailto:/i
+        href = CGI.unescape(href)
+        email = href.strip_prefix("mailto:").strip
+        if email.include?("@")
+          found_emails << email 
+        else
+          STDERR.puts "invalid mailto link"
+        end
+      when /^javascript:linkto/i
+        href = CGI.unescape(href)
+        if href =~ /javascript:linkTo_UnCryptMailto\s*\(\'([^']*)'/i
+          begin
+            found_emails << decode_mailto($1, mail_domain)
+          rescue => ex
+            STDERR.puts ex.message
+          end
+          uses_encryption = true
+        else
+          STDERR.puts "Cannot decrypt javascript linkto: #{href}"
+        end
       end
-    when /^javascript:linkto/i
-      href = CGI.unescape(href)
-      if href =~ /javascript:linkTo_UnCryptMailto\s*\(\'([^']*)'/i
-        found_emails << decode_mailto($1, mail_domain)
-        uses_encryption = true
-      else
-        STDERR.puts "Cannot decrypt javascript linkto: #{href}"
-      end
-    end
-  }
+    }
 
-  {
-    email: found_emails,
-    ranked_emails: rank_emails(found_emails, mail_domain).map{|a| a[1]},
-    imprint_link: site_link,
-    domain: domain,
-    mail_domain: mail_domain,
-    uses_encryption: uses_encryption
-  }
+    {
+      email: found_emails,
+      ranked_emails: rank_emails(found_emails, mail_domain).map{|a| a[1]},
+      imprint_link: site_link,
+      domain: domain,
+      mail_domain: mail_domain,
+      uses_encryption: uses_encryption
+    }
+  end
+
+
+  def crawl_site_using_fetcher(site_link)
+    domain = URI.parse(site_link).host
+    mail_domain = domain.strip_prefix("www.")
+
+    body = @fetcher.fetch site_link
+    doc = Nokogiri::HTML(body)
+
+    found_emails = []
+
+    doc.css('body').first.content.scan(/[0-9A-Za-z.,+\/:-]+@[^.]+\.de/) {|match|
+      found_emails << match
+    }
+
+    uses_encryption = false
+
+    doc.css('a').each { |elm|
+      href = elm['href']
+      case href
+      when /^mailto:/i
+        href = CGI.unescape(href)
+        email = href.strip_prefix("mailto:").strip
+        if email.include?("@")
+          found_emails << email 
+        else
+          STDERR.puts "invalid mailto link"
+        end
+      when /^javascript:linkto/i
+        href = CGI.unescape(href)
+        if href =~ /javascript:linkTo_UnCryptMailto\s*\(\'([^']*)'/i
+          found_emails << decode_mailto($1, mail_domain)
+          uses_encryption = true
+        else
+          STDERR.puts "Cannot decrypt javascript linkto: #{href}"
+        end
+      end
+    }
+
+    {
+      email: found_emails,
+      ranked_emails: rank_emails(found_emails, mail_domain).map{|a| a[1]},
+      imprint_link: site_link,
+      domain: domain,
+      mail_domain: mail_domain,
+      uses_encryption: uses_encryption
+    }
+  end
 end
 
 def rank_emails(emails, mail_domain)
@@ -264,7 +351,8 @@ class State
 end
 
 def crawl_all(state, snapshot_every_seconds: nil)
-  driver = nil
+  crawler = Crawler.new(driver: Selenium::WebDriver.for(:chrome), fetcher: Fetcher.new)
+
   last_snapshot = nil
   snapshot_no = 1
   started_at = Time.now
@@ -285,9 +373,8 @@ def crawl_all(state, snapshot_every_seconds: nil)
     p line_no, line
 
     begin
-      driver = driver || Selenium::WebDriver.for(:chrome)
 
-      info = crawl_site(driver, line + " Impressum")
+      info = crawler.crawl_site_from_searchterm(line + " Impressum")
       info[:line] = line
       info[:line_no] = line_no
       pp info
@@ -295,16 +382,12 @@ def crawl_all(state, snapshot_every_seconds: nil)
       state.success << info
     rescue Exception => ex
       p ex
-      begin
-        driver.close if driver
-      rescue Exception
-      end
       driver = nil
       state.failed << {line_no: line_no, line: line, error: ex.message, backtrace: ex.backtrace}
     end
   end
 ensure
-  driver.quit if driver
+  crawler.driver.quit
 end
 
 if __FILE__ == $0
@@ -319,8 +402,14 @@ if __FILE__ == $0
     state = State.new(remaining: lines)
   when 'load-snapshot'
     state = State.load(ARGV[1] || raise)
+  when 'retry-failed'
+    state = State.load(ARGV[1] || raise)
+    state.failed.each do |entry|
+      state.remaining << [entry['line_no'], entry['line']]
+    end
+    state.failed.clear
   else
-    raise "Usage: #{$0} new <file> | load-snapshot <snapshot>"
+    raise "Usage: #{$0} new <file> | load-snapshot <snapshot> | retry-failed <snapshot>"
   end
 
   begin
